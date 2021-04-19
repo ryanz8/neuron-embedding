@@ -1,6 +1,6 @@
 Public repository for neuron embedding paper.
 
-# My Paper Title
+# Representing Individual Neurons for Neuroevolution
 
 This repository is the official implementation of Representing Individual Neurons for Neuroevolution.
 
