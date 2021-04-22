@@ -22,20 +22,46 @@ To train the models in the paper, run this command:
 python run_train_test.py -m <modeltype> -e <epochs> -d <embedding dimension>
 ```
 
+Example:
+```
+python run_train_test.py -m Emb -e 2 -d 64
+```
+
 ```<modeltype>``` can be one of FC (fully connected, direct encoding), Conv (convolutional, direct encoding), Emb (fully connected, neuron embedding), EmbConv (convolutional, neuron embedding).
 
 After every epoch, training model will be saved as ```epoch<epochnum>.pth``` in the ```models``` folder.
 
 
 ## Evaluation
+Results from evaluation are displayed in Visdom. Ensure Visdom is open before running.
 
-To train a model to match a reference, run
-```eval
-python train_to_ref.py -r <target fully connected model> -s <path to save model> -d <embedding dimension>          
+### Evaluating performance
+To evaluate a trained model, run:
+```
+python run_train_test.py -m <modeltype>  -d <embedding dimension> -l <model to load>
+```
+Example:
+```
+python run_train_test.py -m Emb  -d 64 -l models/trained_to_ref_1.pth
 ```
 
-To run the crossover experiments, run
+### Matching reference
+To train a model to match a reference, run:
+```eval
+python run_train_to_ref.py -r <target fully connected model> -s <path to save model> -d <embedding dimension>          
+```
+Example:
+```
+python run_train_to_ref.py -r models/fc.pth -s models/tmp.pth -d 64
+```
 
+### Crossover
+
+To run the crossover experiments, run:
+```eval
+python run_crossover.py -fc1 <recipient FC model>  -fc2 <donor FC model> -emb1 <recipient embedding model> -emb2 <donor embedding model>
+```
+Example:
 ```eval
 python run_crossover.py -fc1 models/fc.pth -fc2 models/fc2.pth -emb1 models/trained_to_ref_1.pth -emb2 models/trained_to_ref_2.pth
 ```

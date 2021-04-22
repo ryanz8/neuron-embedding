@@ -13,7 +13,7 @@ import time
 import models
 import config
 from traintest import *
-from util import getdev
+from util import getdev, load
 import loader
 from models import scaled_dot, unscaled_dot, get_embeddings, get_layers, get_weights
 
@@ -23,7 +23,10 @@ import embedding
 import argparse
 
 def interpolate(model1, model2, coefficient):
-    # do linear interpolation
+    '''
+    Does linear interpolation between the weights of two models.
+    '''
+
     # seems like it's safer to do it via the state_dict?
     sd1 = model1.state_dict()
     sd2 = model2.state_dict()
@@ -76,25 +79,14 @@ if __name__ == "__main__":
         input_size = (3, 32, 32)
 
     ref_model_1 = models.FCNet().to(dev)
-    if args.fc1 is not None:
-        log(f'Loading model {args.fc1}')
-        ref_model_1.load_state_dict(torch.load(args.fc1))
-
-
     ref_model_2 = models.FCNet().to(dev)
-    if args.fc2 is not None:
-        log(f'Loading model {args.fc2}')
-        ref_model_2.load_state_dict(torch.load(args.fc2))
-
     emb_model_1 = models.NeuronEmbedding(args.dims).to(dev)
-    if args.emb1 is not None:
-        log(f'Loading model {args.emb1}')
-        emb_model_1.load_state_dict(torch.load(args.emb1))
-
     emb_model_2 = models.NeuronEmbedding(args.dims).to(dev)
-    if args.emb2 is not None:
-        log(f'Loading model {args.emb2}')
-        emb_model_2.load_state_dict(torch.load(args.emb2))
+
+    load(ref_model_1, args.fc1)
+    load(ref_model_2, args.fc2)
+    load(emb_model_1, args.emb1)
+    load(emb_model_2, args.emb2)
 
     # interpolation models
     ref_model_lerp = models.FCNet().to(dev)

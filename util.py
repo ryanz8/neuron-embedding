@@ -96,3 +96,8 @@ def imshow(img, labels, vis):
 #    plt.show()
     vis.matplot(plt, win='img')
     log(' '.join('%5s' % classes[labels[j]] for j in range(6)), vis)
+
+def load(model, name):
+    if name is not None:
+        log(f'Loading model {name}')
+        model.load_state_dict(torch.load(name))
