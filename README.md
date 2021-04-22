@@ -12,7 +12,7 @@ To install requirements:
 pip install -r requirements.txt
 ```
 
-visdom should be running in order to view the plots.
+Visdom should be running in order to view the plots.
 
 ## Training
 
