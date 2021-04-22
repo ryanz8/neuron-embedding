@@ -6,6 +6,8 @@ This repository is the official implementation of Representing Individual Neuron
 
 ## Requirements
 
+This code was tested on Python 3.8.
+
 To install requirements:
 
 ```setup
