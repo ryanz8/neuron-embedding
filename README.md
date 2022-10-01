@@ -22,11 +22,14 @@ To train the models in the paper, run this command:
 
 ```train
 python run_train_test.py -m <modeltype> -e <epochs> -d <embedding dimension>
+python run_train_test.py -c <configname>
 ```
+
+```configname``` is the name of the configuration found in ```configs/settings.conf```. All training settings should be changed there.
 
 Example:
 ```
-python run_train_test.py -m Emb -e 2 -d 64
+python run_train_test.py -c Emb
 ```
 
 ```<modeltype>``` can be one of FC (fully connected, direct encoding), Conv (convolutional, direct encoding), Emb (fully connected, neuron embedding), EmbConv (convolutional, neuron embedding).
@@ -50,25 +53,35 @@ python run_train_test.py -m Emb  -d 64 -l models/trained_to_ref_1.pth
 ### Matching reference
 To train a model to match a reference, run:
 ```eval
-python run_train_to_ref.py -r <target fully connected model> -s <path to save model> -d <embedding dimension>          
+python run_train_to_ref.py -r <target fully connected model> -s <path to save model> -c <fully connected config setting> -e <embedded model config>
 ```
 Example:
 ```
-python run_train_to_ref.py -r models/fc.pth -s models/tmp.pth -d 64
+python run_train_to_ref.py -r models/fc.pth -s models/tmp.pth -c FC -e Emb_ref
 ```
+
+### Interpolation
+
+To run the crossover experiment, run:
+```eval
+python run_interpolation.py
+```
+
+Settings for this experiment are in ```crossover.conf```.
 
 ### Crossover
 
-To run the crossover experiments, run:
+To run the crossover experiment, run:
 ```eval
-python run_crossover.py -fc1 <recipient FC model>  -fc2 <donor FC model> -emb1 <recipient embedding model> -emb2 <donor embedding model>
+python run_crossover.py -l <layer number>
 ```
 Example:
 ```eval
-python run_crossover.py -fc1 models/fc.pth -fc2 models/fc2.pth -emb1 models/trained_to_ref_1.pth -emb2 models/trained_to_ref_2.pth
+python run_crossover.py -l 1
 ```
 
-Use the parameter ```-c``` to select linear interpolation (1) or neuron transplant (2).
+Settings for this experiment are in ```crossover.conf```.
+
 
 ## Pre-trained Models
 

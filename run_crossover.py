@@ -1,189 +1,296 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as transforms
-
 import numpy as np
-
 import visdom
-import matplotlib.pyplot as plt
-
-import time
-import models
-import config
-from traintest import *
-from util import getdev, load
-import loader
-from models import scaled_dot, unscaled_dot, get_embeddings, get_layers, get_weights
-
-from torchsummary import summary
-
-import embedding
+import itertools
 import argparse
+import configparser
 
-def interpolate(model1, model2, coefficient):
-    '''
-    Does linear interpolation between the weights of two models.
-    '''
+from src import config
+from src import loader
+from src.util import getdev, load
+from src.traintest import *
+from src.crossover import swap_neurons, transfer_layers, swap_outgoing
 
-    # seems like it's safer to do it via the state_dict?
-    sd1 = model1.state_dict()
-    sd2 = model2.state_dict()
-
-    interp_dict = {k: torch.lerp(sd1[k], sd2[k], coefficient) for k in sd1.keys()}
-    return interp_dict
-
-def swap_neurons(model1, model2, layer_names, neuron_ids):
-    '''
-    Swaps neurons specified by neuron_ids in layer_name from model2 to model1.
-    
-    layer_names: list of layers to swap
-    n_neurons: list of lists of neurons to swap in each layer, in the same order as layer_names
-    '''
-    sd1 = model1.state_dict()
-    sd2 = model2.state_dict()
-    
-    sd_new = sd1.copy()
-
-    
-    for layer_name, ids in zip(layer_names, neuron_ids):
-        sd_new[layer_name][ids] = sd2[layer_name][ids].clone().detach()
-#         sd1[layer_name][:n] = sd2[layer_name][:n]
-    return sd_new
+import warnings
+warnings.filterwarnings("ignore", message="Setting attributes on ParameterDict is not supported.")
 
 if __name__ == "__main__":
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-fc1", type=str, help="path to first/recipient fully connected model", required=True)
-    parser.add_argument("-fc2", type=str, help="path to second/donor fully connected model", required=True)
-    parser.add_argument("-emb1", type=str, help="path to first/recipient fully connected model", required=True)
-    parser.add_argument("-emb2", type=str, help="path to second/donor fully connected model", required=True)
-    parser.add_argument("--crossmode", "-c", type=int, help="Crossover mode: 1 - linear interpolation, 2 - neuron transplant", default=1)
-    parser.add_argument("--dims", "-d", type=int, help="number of dimensions in embedding", default=64)
-    args = parser.parse_args()
-
-
     dev = getdev()
+    torch.seed()
 
+    ROOT_DIR = config.ROOT_DIR
     config.vis = visdom.Visdom()
     vis = config.vis
 
-    dataset = 'MNIST'
+    parser = argparse.ArgumentParser()
+#    parser.add_argument("--dataset", "-d", type=str, help="dataset: MNIST, MNIST32", default='MNIST')
+    parser.add_argument("--layernum", "-l", type=int, help="layer number to crossover: 0 = first hidden layer, 7 = 8th hidden layer", default=0)
+    parser.add_argument("--transfer_previous", help="fully transfer previous layers? should be ON", action='store_true')
+    parser.add_argument("--crossover_previous", help="do crossover on previous layers (not compatible with transfer_previous)? should be OFF", action='store_true')
+    parser.add_argument("--crossover_outgoing", help="crossover outgoing connections in the last layer of the direct version? should be OFF", action='store_true')
+    parser.add_argument("--cnn", help="If set, will do crossover experiment for CNNs instead of FCs", action='store_true')
+    args = parser.parse_args()
 
-    if dataset == 'MNIST':
-        train_loader, val_loader, test_loader = loader.MNIST()
-        input_size = (1, 28, 28)
-    elif dataset == 'CIFAR10':
-        train_loader, val_loader, test_loader = loader.MNIST()
-        input_size = (3, 32, 32)
+    parser = configparser.ConfigParser()
+    with open(ROOT_DIR + '/configs/crossover.conf') as f:
+        parser.read_file(f)
+    file_settings = parser['Crossover']
 
-    ref_model_1 = models.FCNet().to(dev)
-    ref_model_2 = models.FCNet().to(dev)
-    emb_model_1 = models.NeuronEmbedding(args.dims).to(dev)
-    emb_model_2 = models.NeuronEmbedding(args.dims).to(dev)
+    if args.cnn:
+        dir_config = file_settings['conv_config']
+        emb_config = file_settings['embconv_config']
+    else:
+        dir_config = file_settings['fc_config']
+        emb_config = file_settings['emb_config']
 
-    load(ref_model_1, args.fc1)
-    load(ref_model_2, args.fc2)
-    load(emb_model_1, args.emb1)
-    load(emb_model_2, args.emb2)
+    dir_params = loader.read_config(config_name = dir_config)
+    emb_params = loader.read_config(config_name = emb_config)
 
-    # interpolation models
-    ref_model_lerp = models.FCNet().to(dev)
-    emb_model_lerp = models.NeuronEmbedding(args.dims).to(dev)
+    dir_model_1 = loader.setup_model(dir_params, dev = dev)
+    dir_model_2 = loader.setup_model(dir_params, dev = dev)
+    emb_model_1 = loader.setup_model(emb_params, dev = dev)
+    emb_model_2 = loader.setup_model(emb_params, dev = dev)
 
-    if args.crossmode == 1:
-        # do linear interpolation
-        # linear interpolation of FC
+    train_loader, val_loader, test_loader, input_size = loader.load_data(dataset_name = dir_params['dataset'], batch_size = dir_params['batch_size'])
+
+    if args.cnn:
+        load(dir_model_1, ROOT_DIR+file_settings['conv1_path'])
+        load(dir_model_2, ROOT_DIR+file_settings['conv2_path'])
+
+        if not file_settings['embconv1_path']:
+            train_to_conv(emb_model_1, dir_model_1, dir_params)
+        else:
+            load(emb_model_1, ROOT_DIR+file_settings['embconv1_path'])
+
+        if not file_settings['embconv2_path']:
+            train_to_conv(emb_model_2, dir_model_2, dir_params,
+                        fixed_embedding_names = ['pointwise_embs.0.weight', 'lin_embs.0.weight'],
+                        fixed_embeddings = [emb_model_1.state_dict()['pointwise_embs.0.weight'],
+                                            emb_model_1.state_dict()['lin_embs.0.weight']]
+                        )
+        else:
+            load(emb_model_2, ROOT_DIR+file_settings['embconv2_path'])
+    else:
+        load(dir_model_1, ROOT_DIR+file_settings['fc1_path'])
+        load(dir_model_2, ROOT_DIR+file_settings['fc2_path'])        
+
+        if not file_settings['emb1_path']:
+            train_to(emb_model_1, dir_model_1, dir_params)
+        else:
+            load(emb_model_1, ROOT_DIR+file_settings['emb1_path'])
+
+        if not file_settings['emb2_path']:
+            train_to(emb_model_2, dir_model_2, dir_params,
+                fixed_embeddings = [emb_model_1.state_dict()['embs.0.weight']],
+                fixed_layer_nums = [0])
+        else:
+            load(emb_model_2, ROOT_DIR+file_settings['emb2_path'])
+
+    # setup transfer models
+    dir_model_crossover = loader.setup_model(dir_params, dev)
+    emb_model_crossover = loader.setup_model(emb_params, dev)
+
+    # make sure dropout is off
+    for m in [dir_model_1, dir_model_2, emb_model_1, emb_model_2, dir_model_crossover, emb_model_crossover]:
+        m.eval()
+
+    log(f'transfer_previous: {args.transfer_previous}, crossover_previous: {args.crossover_previous}, crossover_outgoing: {args.crossover_outgoing}')
+    log('fc 1 evaluation:' + str(evaluate(dir_model_1, test_loader, test_metrics)))
+    log('fc 2 evaluation:' + str(evaluate(dir_model_2, test_loader, test_metrics)))
+    log('emb 1 evaluation:' + str(evaluate(emb_model_1, test_loader, test_metrics)))
+    log('emb 2 evaluation:' + str(evaluate(emb_model_2, test_loader, test_metrics)))
+
+    # set order of transplant
+    ids = []
+    if args.cnn:
+        for i in range(len(dir_model_1.conv_layer_size)-1):
+            ids.append(np.random.permutation(dir_model_1.conv_layer_size[i+1])) #np.arange
+    else:
+        for i in range(len(dir_model_1.layer_size)-1):
+            ids.append(np.random.permutation(dir_model_1.layer_size[i+1])) #np.arange
+
+    layer_num = args.layernum # 0 = first hidden layer, 7 = 8th hidden layer
+
+    log('FC model:' + str(dir_model_1))
+    log('Emb model:' + str(emb_model_1))
+    log('Layer_num:' + str(layer_num) + ' in order: ' + str(ids))
+
+    dir_losses = []
+    emb_losses = []
+
+    if not args.cnn:
+        # transplant direct representation neurons
         for coeff in np.linspace(0, 1, 21):
-            # linear interpolation of FC model
-            ref_model_lerp.load_state_dict(interpolate(ref_model_1, ref_model_2, coeff))
-            loss_test = evaluate(ref_model_lerp, test_loader, test_metrics).flatten()
+            n_layer = [round(l * coeff) for l in dir_model_1.layer_size]
+
+            if args.crossover_previous:
+                # transfer a fraction of all layers
+                dir_layer_names = [f'linears.{i}.{j}' for i in range(layer_num+1) for j in ['weight', 'bias']]
+                dir_neuron_ids = [ids[i][:n_layer[layer_num+1]] for i in itertools.chain(*[itertools.repeat(x, 2) for x in range(layer_num+1)])]
+
+                emb_layer_names = [f'embs.{i+1}.weight' for i in range(layer_num+1)] + [f'biases.{i}' for i in range(layer_num+1)]
+                emb_neuron_ids = [ids[i][:n_layer[layer_num+1]] for i in range(layer_num+1)] + [ids[i][:n_layer[layer_num+1]] for i in range(layer_num+1)]
+            else:
+                # just transfer the one layer
+                dir_layer_names = [f'linears.{layer_num}.weight',f'linears.{layer_num}.bias']
+                dir_neuron_ids = [ids[layer_num][:n_layer[layer_num+1]], ids[layer_num][:n_layer[layer_num+1]]]
+                
+                emb_layer_names = [f'embs.{layer_num+1}.weight', f'biases.{layer_num}']
+                emb_neuron_ids = [ids[layer_num][:n_layer[layer_num+1]], ids[layer_num][:n_layer[layer_num+1]]]
             
-            vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='interpolation loss', name='Direct Encoding', update = 'append')
-            vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='interpolation acc', name='Direct Encoding', update = 'append')
-
-            log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
-
-        # linear interpolation of embedding model
-        for coeff in np.linspace(0, 1, 21):
-            emb_model_lerp.load_state_dict(interpolate(emb_model_1, emb_model_2, coeff))
-            loss_test = evaluate(emb_model_lerp, test_loader, test_metrics).flatten()
+            # crossover on direct representation
+            dir_model_crossover.load_state_dict(swap_neurons(dir_model_1, dir_model_2,
+                                                        layer_names = dir_layer_names,
+                                                        neuron_ids = dir_neuron_ids))
+            if args.crossover_outgoing:
+                dir_model_crossover.load_state_dict(swap_outgoing(dir_model_crossover, dir_model_2,
+                                                            layer_names = [f'linears.{layer_num+1}.weight'],
+                                                            neuron_ids = [ids[layer_num][:n_layer[layer_num+1]]]))
+                        
+            if args.transfer_previous:
+                dir_transfer_layer_names = [f'linears.{i}.{j}' for i in range(layer_num) for j in ['weight', 'bias']]
+                dir_model_crossover.load_state_dict(transfer_layers(dir_model_crossover, dir_model_2,
+                                                            layer_names = dir_transfer_layer_names))
             
-            vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='interpolation loss', name='Neuron Embedding', update = 'append')
-            vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='interpolation acc', name='Neuron Embedding', update = 'append')
 
-            log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
-
-
-        # make the graphs look nice
-        vis.update_window_opts(
-            win='interpolation loss',
-            opts=dict(
-                showlegend = True,
-                title = 'Crossentropy loss, linear interpolation',
-                xlabel = 'Interpolation coefficient',
-                ylabel = 'Crossentropy loss',
-                width = 600,
-                height = 400
-            )
-        )
-
-        vis.update_window_opts(
-            win='interpolation acc',
-            opts=dict(
-                showlegend = True,
-                title = 'Accuracy, linear interpolation',
-                xlabel= 'Interpolation coefficient',
-                ylabel= 'Accuracy',
-                width= 600,
-                height= 400,
-                ytickmin=0,
-                ytickmax=1
-            ),
-        )
-
-    elif args.crossmode == 2:
-        # do neuron crossover
-
-        # set order of transplant
-        # can be used to test a different order
-        ids_1 = np.arange(ref_model_1.layer_size[1]) #np.random.permutation(ref_model_1.layer_size[1])
-        ids_2 = np.arange(ref_model_1.layer_size[2]) #np.random.permutation(ref_model_1.layer_size[2])
-
-        # neuron swapping FC models
-        for coeff in np.linspace(0, 1, 21):
-            n_layer_1, n_layer_2 = round(ref_model_1.layer_size[1] * coeff), round(ref_model_1.layer_size[2] * coeff)
+            loss_test = evaluate(dir_model_crossover, test_loader, test_metrics).flatten()
             
-            ref_model_lerp.load_state_dict(swap_neurons(ref_model_1, ref_model_2,
-                                                        layer_names = ['fc1.weight','fc1.bias'],
-                                                        neuron_ids = [ids_1[:n_layer_1], ids_1[:n_layer_1]]))
-            loss_test = evaluate(ref_model_lerp, test_loader, test_metrics).flatten()
-            
+            dir_losses.append(loss_test)
+
             vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='crossover loss', name='Direct Encoding', update = 'append')
             vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='crossover acc', name='Direct Encoding', update = 'append')
 
             log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
 
-
-        # neuron swapping for embeddings
-        for coeff in np.linspace(0, 1, 21):
-            n_layer_1, n_layer_2 = round(emb_model_1.layer_size[1] * coeff), round(emb_model_1.layer_size[2] * coeff)
-            emb_model_lerp.load_state_dict(swap_neurons(emb_model_1, emb_model_2,
-                                                        layer_names = ['embs.1.weight', 'biases.0'],
-                                                        neuron_ids = [ids_1[:n_layer_1], ids_1[:n_layer_1]]))
-            loss_test = evaluate(emb_model_lerp, test_loader, test_metrics).flatten()
+            
+            # crossover on embedding representation
+            emb_model_crossover.load_state_dict(swap_neurons(emb_model_1, emb_model_2,
+                                                        layer_names = emb_layer_names,
+                                                        neuron_ids = emb_neuron_ids))
+            if args.transfer_previous:
+                emb_transfer_layer_names = [f'embs.{i+1}.weight' for i in range(layer_num)] + [f'biases.{i}' for i in range(layer_num)]
+                emb_model_crossover.load_state_dict(transfer_layers(emb_model_crossover, emb_model_2,
+                                                            layer_names = emb_transfer_layer_names
+                                                            ))
+            loss_test = evaluate(emb_model_crossover, test_loader, test_metrics).flatten()
+            
+            emb_losses.append(loss_test)
             
             vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='crossover loss', name='Neuron Embedding', update = 'append')
             vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='crossover acc', name='Neuron Embedding', update = 'append')
-
+            
             log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
+
+        np.save('log/crossover/fc_dir_losses.npy', np.stack(dir_losses))
+        np.save('log/crossover/fc_emb_losses.npy', np.stack(emb_losses))
 
         vis.update_window_opts(
             win='crossover loss',
             opts=dict(
                 showlegend = True,
                 title = 'Crossentropy loss, neuron transplant',
+                xlabel = 'Crossover coefficient',
+                ylabel = 'Crossentropy loss',
+                width = 400,
+                height = 200
+            )
+        )
+
+        vis.update_window_opts(
+            win='crossover acc',
+            opts=dict(
+                showlegend = True,
+                title = 'Accuracy, neuron transplant for FC',
+                xlabel= 'Crossover coefficient',
+                ylabel= 'Accuracy',
+                width= 400,
+                height= 200
+        #         ytickmin=0,
+        #         ytickmax=1
+            ),
+        )
+
+    elif args.cnn:
+
+
+        # transplant direct representation neurons
+        for coeff in np.linspace(0, 1, 21):
+            n_layer = [round(l * coeff) for l in dir_model_1.conv_layer_size]
+
+        #     if args.crossover_previous:
+        #         # transfer a fraction of all layers
+        #         dir_layer_names = [f'linears.{i}.{j}' for i in range(layer_num+1) for j in ['weight', 'bias']]
+        #         dir_neuron_ids = [ids[i][:n_layer[layer_num+1]] for i in itertools.chain(*[itertools.repeat(x, 2) for x in range(layer_num+1)])]
+
+        #         emb_layer_names = [f'embs.{i+1}.weight' for i in range(layer_num+1)] + [f'biases.{i}' for i in range(layer_num+1)]
+        #         emb_neuron_ids = [ids[i][:n_layer[layer_num+1]] for i in range(layer_num+1)] + [ids[i][:n_layer[layer_num+1]] for i in range(layer_num+1)]
+        #     else:
+            # just transfer the one layer
+            dir_layer_names = [f'pointwise_convs.{layer_num}.weight',
+                                f'depthwise_convs.{layer_num}.weight',
+                                f'depthwise_convs.{layer_num}.bias']
+            dir_neuron_ids = [ids[layer_num][:n_layer[layer_num+1]],
+                            ids[layer_num][:n_layer[layer_num+1]],
+                            ids[layer_num][:n_layer[layer_num+1]]]
+
+            emb_layer_names = [f'pointwise_embs.{layer_num+1}.weight',
+                            f'depthwise_convs.{layer_num}.weight',
+                            f'depthwise_convs.{layer_num}.bias']
+            emb_neuron_ids = [ids[layer_num][:n_layer[layer_num+1]],
+                            ids[layer_num][:n_layer[layer_num+1]],
+                            ids[layer_num][:n_layer[layer_num+1]]]
+
+            # crossover on direct representation
+            dir_model_crossover.load_state_dict(swap_neurons(dir_model_1, dir_model_2,
+                                                        layer_names = dir_layer_names,
+                                                        neuron_ids = dir_neuron_ids))
+        #     if args.crossover_outgoing:
+        #         conv_model_crossover.load_state_dict(swap_outgoing(conv_model_crossover, conv_model_2,
+        #                                                     layer_names = [f'linears.{layer_num+1}.weight'],
+        #                                                     neuron_ids = [ids[layer_num][:n_layer[layer_num+1]]]))
+
+        #     if args.transfer_previous:
+        #         conv_transfer_layer_names = [f'linears.{i}.{j}' for i in range(layer_num) for j in ['weight', 'bias']]
+        #         conv_model_crossover.load_state_dict(transfer_layers(conv_model_crossover, conv_model_2,
+        #                                                     layer_names = conv_transfer_layer_names))
+
+
+            loss_test = evaluate(dir_model_crossover, test_loader, test_metrics).flatten()
+
+            dir_losses.append(loss_test)
+
+            vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='crossover loss', name='Direct Encoding', update = 'append')
+            vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='crossover acc', name='Direct Encoding', update = 'append')
+
+            log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
+
+
+            # crossover on embedding representation
+            emb_model_crossover.load_state_dict(swap_neurons(emb_model_1, emb_model_2,
+                                                        layer_names = emb_layer_names,
+                                                        neuron_ids = emb_neuron_ids))
+            if args.transfer_previous:
+                emb_transfer_layer_names = [f'embs.{i+1}.weight' for i in range(layer_num)] + [f'biases.{i}' for i in range(layer_num)]
+                emb_model_crossover.load_state_dict(transfer_layers(emb_model_crossover, emb_model_2,
+                                                            layer_names = emb_transfer_layer_names
+                                                            ))
+            loss_test = evaluate(emb_model_crossover, test_loader, test_metrics).flatten()
+            
+            emb_losses.append(loss_test)
+
+            vis.line(X=np.array([coeff]), Y=np.array([loss_test[0]]), win='crossover loss', name='Neuron Embedding', update = 'append')
+            vis.line(X=np.array([coeff]), Y=np.array([loss_test[1]]), win='crossover acc', name='Neuron Embedding', update = 'append')
+
+            log(f'Coefficient {coeff:.3f}: val loss: {loss_test[0]:.3f}, val acc: {loss_test[1]:.3f}', vis)
+
+        np.save('log/crossover/cnn_dir_losses.npy', np.stack(dir_losses))
+        np.save('log/crossover/cnn_emb_losses.npy', np.stack(emb_losses))
+
+        vis.update_window_opts(
+            win='crossover loss',
+            opts=dict(
+                showlegend = True,
+                title = 'Crossentropy loss, neuron transplant for CNN',
                 xlabel = 'Crossover coefficient',
                 ylabel = 'Crossentropy loss',
                 width = 600,
@@ -194,13 +301,14 @@ if __name__ == "__main__":
         vis.update_window_opts(
             win='crossover acc',
             opts=dict(
-                showlegend = True,
-                title = 'Accuracy, neuron transplant',
+                showlegend = False,
+                title = 'Accuracy, neuron transplant for CNN',
                 xlabel= 'Crossover coefficient',
                 ylabel= 'Accuracy',
-                width= 600,
-                height= 400,
-                ytickmin=0,
-                ytickmax=1
+                width= 400,
+                height= 200
+        #         ytickmin=0,
+        #         ytickmax=1
             ),
         )
+    

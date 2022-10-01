@@ -1,0 +1,6 @@
+# find root directory
+from pathlib import Path
+ROOT_DIR = str(Path(__file__).parent.parent)+'/'
+
+# global visualization object
+vis = None
